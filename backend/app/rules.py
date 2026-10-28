@@ -256,6 +256,7 @@ def assess_vital(
     history: Sequence[tuple[datetime, float]],
     persistence_samples: int,
     latest_present: bool = True,
+    finger_removed: bool = False,
 ) -> VitalAssessment:
     """Evaluate one vital against its band, with persistence and trend.
 
@@ -265,6 +266,26 @@ def assess_vital(
     shown as a signal-quality indicator.
     """
     band = BANDS[metric]
+
+    if finger_removed:
+        # The sensor itself reports no finger. Unlike a noisy reading this is
+        # unambiguous, so it is raised at once instead of waiting for
+        # persistence: a monitor that has lost its patient must say so.
+        return VitalAssessment(
+            metric=metric,
+            label=band.label,
+            unit=band.unit,
+            value=None,
+            severity=Severity.CRITICAL,
+            rule=f"{metric}_finger_removed",
+            message=(
+                f"No finger detected on the sensor, so {band.label.lower()} "
+                f"cannot be measured. Place the fingertip back on the MAX30102."
+            ),
+            trend=Trend("unknown", 0.0, 0.0, 0),
+            normal_range=band.describe_range(),
+            sensor_fault=True,
+        )
 
     if not history:
         return VitalAssessment(
@@ -410,6 +431,7 @@ def assess_patient(
 ) -> PatientAssessment:
     """Run every rule over a window of readings, oldest-first."""
     vitals: list[VitalAssessment] = []
+    finger_removed = bool(rows) and rows[-1].get("finger_detected") is False
 
     for metric in BANDS:
         history: list[tuple[datetime, float]] = []
@@ -425,7 +447,12 @@ def assess_patient(
             history.append((row["recorded_at"], float(value)))
 
         latest_present = bool(rows and rows[-1].get(metric) is not None)
-        vitals.append(assess_vital(metric, history, persistence_samples, latest_present=latest_present))
+        vitals.append(assess_vital(
+            metric, history, persistence_samples,
+            latest_present=latest_present,
+            # Temperature comes from the DS18B20, not the finger sensor.
+            finger_removed=finger_removed and metric != "temperature_c",
+        ))
 
 
     severities = [v.severity for v in vitals if not (v.sensor_fault and v.metric == "spo2")]

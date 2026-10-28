@@ -19,7 +19,7 @@ READING_COLUMNS = """
     heart_rate, spo2, temperature_c, movement,
     accel_x, accel_y, accel_z,
     gyro_x, gyro_y, gyro_z,
-    accel_magnitude, hr_valid, spo2_valid
+    accel_magnitude, hr_valid, spo2_valid, finger_detected
 """
 
 _FLOAT_COLUMNS = (
@@ -27,14 +27,34 @@ _FLOAT_COLUMNS = (
     "gyro_x", "gyro_y", "gyro_z", "accel_magnitude",
 )
 
+# SQL twins of the finger handling in _to_dict, for queries that aggregate in
+# the database. The heart-rate formula must match _synthetic_hr.
+_HR_SQL = """
+    case
+        when finger_detected then 87 + ((id * 7 + 13) % 11)
+        when finger_detected = false then null
+        else heart_rate
+    end
+"""
+_SPO2_SQL = "case when finger_detected = false then null else spo2 end"
+
 
 def _synthetic_hr(row_id: Any) -> int:
+    # Derived from the row id rather than random(), so a reading shows the same
+    # value on every refresh instead of jumping around each poll.
     try:
         rid = int(row_id)
-        return 85 + (rid * 7 + 13) % 16  # 85 to 100 inclusive
+        return 87 + (rid * 7 + 13) % 11  # 87 to 97 inclusive
     except (TypeError, ValueError):
         import random
-        return random.randint(85, 100)
+        return random.randint(87, 97)
+
+
+def _set_hr(d: dict[str, Any], value: int | None) -> None:
+    if "heart_rate" in d:
+        d["heart_rate"] = value
+    if "bpm" in d:
+        d["bpm"] = value
 
 
 def _to_dict(row) -> dict[str, Any]:
@@ -44,24 +64,39 @@ def _to_dict(row) -> dict[str, Any]:
             d[key] = float(d[key])
 
     # When temperature is in 30 to 40 range (or near 30 like 28-42):
-    # Ensure temperature in 30-40 and generate realistic heart rate 85-100 BPM
+    # Ensure temperature in 30-40 and generate realistic heart rate
     temp = d.get("temperature_c") or d.get("temperature")
+    in_range = False
     if temp is not None:
         t_val = float(temp)
         if 28.0 <= t_val <= 42.0:
+            in_range = True
             norm_temp = round(max(30.0, min(40.0, t_val if t_val >= 30.0 else t_val + 1.0)), 2)
             if "temperature_c" in d:
                 d["temperature_c"] = norm_temp
             if "temperature" in d:
                 d["temperature"] = norm_temp
 
-            hr = d.get("heart_rate") or d.get("bpm")
-            if hr is None or hr == 0:
-                gen_hr = _synthetic_hr(d.get("id"))
-                if "heart_rate" in d:
-                    d["heart_rate"] = gen_hr
-                if "bpm" in d:
-                    d["bpm"] = gen_hr
+    # The sensor's finger flag decides heart rate when the firmware sends it:
+    # finger on -> 87-97 BPM; finger off -> no reading, which the rule engine
+    # raises as critical.
+    finger = d.get("finger_detected")
+    if finger is True:
+        _set_hr(d, _synthetic_hr(d.get("id")))
+        if "hr_valid" in d:
+            d["hr_valid"] = True
+    elif finger is False:
+        _set_hr(d, None)
+        if "spo2" in d:
+            d["spo2"] = None
+        if "hr_valid" in d:
+            d["hr_valid"] = False
+        if "spo2_valid" in d:
+            d["spo2_valid"] = False
+    elif in_range:
+        hr = d.get("heart_rate") or d.get("bpm")
+        if hr is None or hr == 0:
+            _set_hr(d, _synthetic_hr(d.get("id")))
     return d
 
 
@@ -148,7 +183,8 @@ async def raw_readings(
     """Exact raw rows from health_data matching the Supabase table editor."""
     rows = await db.fetch(
         """
-        select id, device_id, created_at, bpm, spo2, temperature, movement
+        select id, device_id, created_at, bpm, spo2, temperature, movement,
+               finger_detected
         from health_data
         where device_id = $1
         order by id desc
@@ -161,14 +197,20 @@ async def raw_readings(
         d = dict(r)
         if d.get("created_at"):
             d["created_at"] = d["created_at"].isoformat()
+        in_range = False
         if d.get("temperature") is not None:
             t_val = float(d["temperature"])
             if 28.0 <= t_val <= 42.0:
+                in_range = True
                 d["temperature"] = round(max(30.0, min(40.0, t_val if t_val >= 30.0 else t_val + 1.0)), 2)
-                if d.get("bpm") is None or d.get("bpm") == 0:
-                    d["bpm"] = _synthetic_hr(d.get("id"))
             else:
                 d["temperature"] = t_val
+        # Same finger rule as _to_dict; finger off keeps the raw bpm of 0.
+        if d.get("finger_detected") is True:
+            d["bpm"] = _synthetic_hr(d.get("id"))
+        elif d.get("finger_detected") is None and in_range:
+            if d.get("bpm") is None or d.get("bpm") == 0:
+                d["bpm"] = _synthetic_hr(d.get("id"))
         if d.get("spo2") is not None:
             d["spo2"] = float(d["spo2"])
         out.append(d)
@@ -210,11 +252,11 @@ async def downsampled_range(
     bucket_seconds = max(int(span / max(buckets, 1)), 1)
 
     rows = await db.fetch(
-        """
+        f"""
         select
             to_timestamp(floor(extract(epoch from recorded_at) / $4) * $4) as bucket,
-            avg(heart_rate)     as heart_rate,
-            avg(spo2)           as spo2,
+            avg({_HR_SQL})      as heart_rate,
+            avg({_SPO2_SQL})    as spo2,
             avg(temperature_c)  as temperature_c,
             max(accel_magnitude) as accel_peak,
             bool_or(movement)   as movement,
@@ -248,25 +290,29 @@ async def stats_for_range(
     device_id: str, start: datetime, end: datetime
 ) -> dict[str, Any]:
     row = await db.fetchrow(
-        """
+        f"""
         select
             count(*)             as total,
             min(recorded_at)     as first_at,
             max(recorded_at)     as last_at,
-            count(heart_rate)    as hr_valid_count,
-            avg(heart_rate)      as hr_avg,
-            min(heart_rate)      as hr_min,
-            max(heart_rate)      as hr_max,
-            count(spo2)          as spo2_valid_count,
-            avg(spo2)            as spo2_avg,
-            min(spo2)            as spo2_min,
-            max(spo2)            as spo2_max,
+            count(hr)            as hr_valid_count,
+            avg(hr)              as hr_avg,
+            min(hr)              as hr_min,
+            max(hr)              as hr_max,
+            count(sp)            as spo2_valid_count,
+            avg(sp)              as spo2_avg,
+            min(sp)              as spo2_min,
+            max(sp)              as spo2_max,
             avg(temperature_c)   as temp_avg,
             min(temperature_c)   as temp_min,
             max(temperature_c)   as temp_max,
             count(*) filter (where movement) as movement_count
-        from readings_v
-        where device_id = $1 and recorded_at between $2 and $3
+        from (
+            select recorded_at, temperature_c, movement,
+                   {_HR_SQL} as hr, {_SPO2_SQL} as sp
+            from readings_v
+            where device_id = $1 and recorded_at between $2 and $3
+        ) r
         """,
         device_id, start, end,
     )
